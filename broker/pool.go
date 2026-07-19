@@ -22,7 +22,6 @@ type EventHandler func(ctx context.Context, event models.OrderEvent) error
 // for the same order is handled by the same goroutine, one at a time, in
 // submission order, while different orders are processed fully in parallel.
 type Pool struct {
-	ctx      context.Context
 	handle   EventHandler
 	channels []chan work
 	wg       sync.WaitGroup
@@ -35,9 +34,8 @@ type work struct {
 
 // NewPool starts `workers` goroutines, each with a buffered channel of
 // capacity bufferSize, and returns a Pool ready to accept Submit calls.
-func NewPool(ctx context.Context, workers, bufferSize int, handle EventHandler) *Pool {
+func NewPool(workers, bufferSize int, handle EventHandler) *Pool {
 	p := &Pool{
-		ctx:      ctx,
 		handle:   handle,
 		channels: make([]chan work, workers),
 	}
@@ -53,7 +51,11 @@ func NewPool(ctx context.Context, workers, bufferSize int, handle EventHandler) 
 func (p *Pool) runWorker(ch chan work) {
 	defer p.wg.Done()
 	for w := range ch {
-		if err := p.handle(p.ctx, w.event); err != nil {
+		// Deliberately context.Background(), not a shutdown-cancellable ctx:
+		// once a job is accepted here, it must finish its DB write even if
+		// the service is shutting down (that's what "drain in-flight" means
+		// in Close below). Only new message *fetching* stops on shutdown.
+		if err := p.handle(context.Background(), w.event); err != nil {
 			log.Printf("event %s failed, will redeliver: %v", w.event.EventID, err)
 			_ = w.msg.Nak()
 			continue

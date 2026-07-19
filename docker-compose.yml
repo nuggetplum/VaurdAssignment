@@ -19,10 +19,12 @@ services:
   nats:
     image: nats:2-alpine
     container_name: food_delivery_nats
-    command: ["-js"]
+    command: ["-js", "-m", "8222"]
     ports:
       - "4222:4222"
       - "8222:8222"
+    volumes:
+      - natsdata:/tmp/nats/jetstream
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
       interval: 5s
@@ -31,3 +33,4 @@ services:
 
 volumes:
   pgdata:
+  natsdata:

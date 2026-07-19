@@ -28,6 +28,11 @@ func NewRepository(pool *pgxpool.Pool) *Repository {
 	return &Repository{pool: pool}
 }
 
+// Ping reports whether the database is reachable, for GET /healthz.
+func (r *Repository) Ping(ctx context.Context) error {
+	return r.pool.Ping(ctx)
+}
+
 // applyEventSQL is a single UPSERT that both inserts a brand-new order row and
 // merges an event's fields into an existing one.
 //   - COALESCE(EXCLUDED.col, orders.col) merges only the columns this event
@@ -67,6 +72,16 @@ func (r *Repository) ApplyEvent(ctx context.Context, event models.OrderEvent) er
 	case models.EventOrderCreate:
 		customerID = &event.CustomerID
 		restaurantID = &event.RestaurantID
+		// A create event unambiguously means "this order was just Received" —
+		// not "unknown, ask again later" like the other fields can be. If a
+		// create arrives late for an order that already has a newer status
+		// (the update-before-create defensive path, §3.7), the LWW guard
+		// still protects it: a create's occurredAt is always earlier than any
+		// status change on that order, so `EXCLUDED.last_event_at >
+		// orders.last_event_at` fails first and the whole row update
+		// (including this baseline) is skipped.
+		receivedStatus := models.StatusReceived
+		status = &receivedStatus
 		b, err := json.Marshal(event.Items)
 		if err != nil {
 			return fmt.Errorf("marshal items for event %s: %w", event.EventID, err)
