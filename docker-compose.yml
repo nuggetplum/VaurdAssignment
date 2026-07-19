@@ -1,0 +1,33 @@
+services:
+  postgres_db:
+    image: postgres:15-alpine
+    container_name: food_delivery_db
+    environment:
+      POSTGRES_USER: vaurd_user
+      POSTGRES_PASSWORD: vaurd_password
+      POSTGRES_DB: food_delivery
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vaurd_user -d food_delivery"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  nats:
+    image: nats:2-alpine
+    container_name: food_delivery_nats
+    command: ["-js"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
