@@ -9,6 +9,8 @@ over a simple HTTP API.
   current order state to Postgres, serves `GET /orders`.
 - **Python generator** — publishes a continuous, randomized stream of order
   events (and deliberately injects duplicates/out-of-order events).
+- **Streamlit dashboard** (optional, `dashboard/`) — a minimal frontend to
+  browse orders and check service health without curling the API by hand.
 
 See `DESIGN.md` for the architecture and reasoning, `API.md` for the full
 HTTP contract. This file is just: how do I actually run it.
@@ -164,6 +166,22 @@ and find that order ID in the results — its `customerId`/`restaurantId`
 fields will be absent (unknown), since no create event for it has arrived.
 This demonstrates the service builds a partial record instead of dropping
 the "orphan" update. See `DESIGN.md` for why this is safe.
+
+---
+
+## Step 6 (optional) — Run the Streamlit dashboard
+
+In a fourth terminal:
+
+```bash
+pip install -r dashboard/requirements.txt
+streamlit run dashboard/app.py
+```
+Opens at `http://localhost:8501` — a minimal UI over the same
+`GET /orders`/`GET /healthz` endpoints, with status/sort/limit/offset
+controls and a green/red health indicator. See `dashboard/README.md` for
+details, including running it via Docker instead. Not required for the
+core service to work — purely a convenience for browsing without `curl`.
 
 ---
 
