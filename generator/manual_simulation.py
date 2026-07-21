@@ -23,6 +23,7 @@ import uuid as uuid_mod
 from datetime import datetime, timezone
 
 import nats
+import requests
 
 NATS_URL = os.getenv("NATS_URL", "nats://localhost:4222")
 SUBJECT = "orders.events"
@@ -41,6 +42,19 @@ def order_id_from_event(event_id: str) -> str:
     return str(uuid_mod.uuid5(ORDER_NAMESPACE, event_id))
 
 
+def show_order(api_url, order_id, label):
+    try:
+        resp = requests.get(f"{api_url}/orders", params={"limit": 100}, timeout=3)
+        for o in resp.json().get("orders", []):
+            if o["orderId"] == order_id:
+                items = ", ".join(f"{i['itemId']} x{i['qty']}" for i in o.get("items", []))
+                print(f"     -> [{label}] status={o['status']}, items=[{items}], customerId={o.get('customerId')}, restaurantId={o.get('restaurantId')}")
+                return
+        print(f"     -> [{label}] order not found in API response yet")
+    except requests.exceptions.RequestException as err:
+        print(f"     -> [{label}] could not reach API: {err}")
+
+
 async def publish(js, event, label=""):
     await js.publish(SUBJECT, json.dumps(event).encode())
     print(f"  ['{label or event['eventType']}")
@@ -48,8 +62,15 @@ async def publish(js, event, label=""):
     print()
 
 
-async def pause(seconds=PAUSE_SECONDS):
-    print(f"  ... waiting {seconds}s (check dashboard or curl {API_BASE_URL}/orders)")
+async def observe(order_id, label):
+    await asyncio.sleep(0.5)
+    show_order(API_BASE_URL, order_id, label)
+    print()
+
+
+async def observe_and_pause(order_id, label, seconds=PAUSE_SECONDS):
+    await observe(order_id, label)
+    print(f"  ... next event in {seconds}s")
     await asyncio.sleep(seconds)
     print()
 
@@ -85,9 +106,7 @@ async def main():
     await publish(js, event, "create: Alice orders 2x Margherita + 1x Coke")
     oid_1 = order_id_from_event(eid_1)
     print(f"     -> Order ID: {oid_1}")
-    print(f"     -> Expect: status=Received, items=margherita x2, coke x1")
-    print(f"     -> curl '{API_BASE_URL}/orders?sort=last_updated_desc&limit=5'")
-    await pause()
+    await observe_and_pause(oid_1, "after create")
 
     event = {
         "eventId": "s1-prepare",
@@ -97,8 +116,7 @@ async def main():
         "status": "Preparing",
     }
     await publish(js, event, "status: Preparing")
-    print(f"     -> Expect: status=Preparing")
-    await pause()
+    await observe_and_pause(oid_1, "after status=Preparing")
 
     event = {
         "eventId": "s1-complete",
@@ -108,8 +126,7 @@ async def main():
         "status": "Complete",
     }
     await publish(js, event, "status: Complete")
-    print(f"     -> Expect: status=Complete")
-    await pause()
+    await observe_and_pause(oid_1, "after status=Complete")
 
     # =========================================================================
     # SCENARIO 2: Cancellation from non-terminal state
@@ -128,8 +145,7 @@ async def main():
     await publish(js, event, "create: Bob orders 1x Cheeseburger")
     oid_2 = order_id_from_event(eid_2)
     print(f"     -> Order ID: {oid_2}")
-    print(f"     -> Expect: status=Received")
-    await pause()
+    await observe_and_pause(oid_2, "after create")
 
     event = {
         "eventId": "s2-cancel",
@@ -139,8 +155,7 @@ async def main():
         "status": "Cancelled",
     }
     await publish(js, event, "status: Cancelled")
-    print(f"     -> Expect: status=Cancelled (valid from Received)")
-    await pause()
+    await observe_and_pause(oid_2, "after status=Cancelled")
 
     # =========================================================================
     # SCENARIO 3: Items Replacement
@@ -159,8 +174,7 @@ async def main():
     await publish(js, event, "create: Charlie orders 3x Salmon Roll")
     oid_3 = order_id_from_event(eid_3)
     print(f"     -> Order ID: {oid_3}")
-    print(f"     -> Expect: items=salmon-roll x3")
-    await pause()
+    await observe_and_pause(oid_3, "after create")
 
     event = {
         "eventId": "s3-update-items",
@@ -170,8 +184,7 @@ async def main():
         "items": [{"itemId": "ramen", "qty": 1}, {"itemId": "gyoza", "qty": 2}],
     }
     await publish(js, event, "update.items: ramen x1, gyoza x2")
-    print(f"     -> Expect: items=ramen x1, gyoza x2 (REPLACED, not appended)")
-    await pause()
+    await observe_and_pause(oid_3, "after items replaced")
 
     # =========================================================================
     # SCENARIO 4: Invalid Status Transition
@@ -190,7 +203,7 @@ async def main():
     await publish(js, event, "create: Diana orders 1x Caesar Salad")
     oid_4 = order_id_from_event(eid_4)
     print(f"     -> Order ID: {oid_4}")
-    await pause()
+    await observe_and_pause(oid_4, "after create")
 
     event = {
         "eventId": "s4-complete",
@@ -200,8 +213,7 @@ async def main():
         "status": "Complete",
     }
     await publish(js, event, "status: Complete")
-    print(f"     -> Expect: status=Complete")
-    await pause()
+    await observe_and_pause(oid_4, "after status=Complete")
 
     event = {
         "eventId": "s4-invalid",
@@ -211,9 +223,8 @@ async def main():
         "status": "Preparing",
     }
     await publish(js, event, "status: Preparing (INVALID transition!)")
-    print(f"     -> Expect: status STAYS Complete (state machine rejects Preparing)")
+    await observe_and_pause(oid_4, "after INVALID Preparing (expect STILL Complete)")
     print(f"     -> Check service logs for 'invalid status transition rejected'")
-    await pause()
 
     # =========================================================================
     # SCENARIO 5: Update-Before-Create
@@ -233,9 +244,8 @@ async def main():
         "status": "Preparing",
     }
     await publish(js, event, "status update BEFORE any create (update-before-create)")
-    print(f"     -> Expect: PARTIAL row created, status=Preparing, customerId=null, restaurantId=null")
-    print(f"     -> The service does NOT crash -- it creates a row on the fly (plan.md section 3.7)")
-    await pause()
+    print(f"     -> The service should NOT crash -- it creates a row on the fly")
+    await observe_and_pause(oid_5, "after update-before-create (expect partial row: status=Preparing, null customer/restaurant)")
 
     event = {
         "eventId": "s5-update-items",
@@ -245,9 +255,7 @@ async def main():
         "items": [{"itemId": "taco", "qty": 3}],
     }
     await publish(js, event, "update.items on the partial row (status=NULL -> bypasses state machine)")
-    print(f"     -> Expect: items=taco x3 set on the partial row, status stays Preparing")
-    print(f"     -> Items updates have no status, so EXCLUDED.status IS NULL passes the WHERE clause")
-    await pause()
+    await observe_and_pause(oid_5, "after items update on partial row (expect items=taco x3)")
 
     event = {
         "eventId": create_eid_5,
@@ -258,10 +266,7 @@ async def main():
         "items": [{"itemId": "taco", "qty": 3}],
     }
     await publish(js, event, "create arrives late (gracefully handled as no-op)")
-    print(f"     -> Expect: no change (state machine blocks Preparing -> Received)")
-    print(f"     -> The system does NOT error or crash -- event is silently ignored (correct)")
-    print(f"     -> Note: customer/restaurant stay null because the create's status transition is blocked")
-    await pause()
+    await observe_and_pause(oid_5, "after late create (expect no change -- state machine blocks Prepar->Received)")
 
     # =========================================================================
     # SCENARIO 6: Duplicate + Out-of-Order (LWW)
@@ -280,13 +285,11 @@ async def main():
     await publish(js, event, "create: Frank orders 1x Pad Thai")
     oid_6 = order_id_from_event(eid_6)
     print(f"     -> Order ID: {oid_6}")
-    print(f"     -> Expect: status=Received")
-    await pause()
+    await observe_and_pause(oid_6, "after create")
 
     await publish(js, event, "REPLAY: exact same create event (same eventId)")
     print(f"     -> Expect: NO change (PK conflict -> no-op, deterministic UUIDv5)")
-    print(f"     -> Verify: total order count stays the same")
-    await pause()
+    await observe_and_pause(oid_6, "after duplicate replay (expect identical state)")
 
     event = {
         "eventId": "s6-prepare",
@@ -296,8 +299,7 @@ async def main():
         "status": "Preparing",
     }
     await publish(js, event, "status: Preparing")
-    print(f"     -> Expect: status=Preparing")
-    await pause()
+    await observe_and_pause(oid_6, "after status=Preparing")
 
     stale_time = "2024-01-01T00:00:00+00:00"
     event = {
@@ -308,9 +310,7 @@ async def main():
         "status": "Complete",
     }
     await publish(js, event, f"STALE: backdated status update (occurredAt={stale_time})")
-    print(f"     -> Expect: status STAYS Preparing (LWW: stale timestamp rejected)")
-    print(f"     -> Verify: the event's occurredAt is older than last_event_at")
-    await pause()
+    await observe_and_pause(oid_6, "after stale Complete (expect STILL Preparing -- LWW rejected)")
 
     # =========================================================================
     # SUMMARY

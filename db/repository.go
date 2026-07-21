@@ -121,6 +121,20 @@ func (r *Repository) ApplyEvent(ctx context.Context, event models.OrderEvent) er
 		r.logInvalidOrStaleStatusUpdate(ctx, event)
 	}
 
+	if tag.RowsAffected() > 0 {
+		switch event.EventType {
+		case models.EventOrderCreate:
+			log.Printf("applied event: order=%s type=%s status=%q items=%v",
+				event.OrderID, event.EventType, models.StatusReceived, event.Items)
+		case models.EventOrderUpdateStatus:
+			log.Printf("applied event: order=%s type=%s status=%q",
+				event.OrderID, event.EventType, event.Status)
+		case models.EventOrderUpdateItems:
+			log.Printf("applied event: order=%s type=%s items=%v",
+				event.OrderID, event.EventType, event.Items)
+		}
+	}
+
 	return nil
 }
 

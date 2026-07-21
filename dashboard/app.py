@@ -9,6 +9,7 @@ backend's base URL from the API_URL env var.
 """
 
 import os
+import time
 
 import requests
 import streamlit as st
@@ -86,6 +87,11 @@ def render_orders_table():
         )
 
     st.dataframe(rows, width="stretch", hide_index=True)
+
+    auto = st.checkbox("Auto-refresh (3s)", value=True)
+    if auto:
+        time.sleep(3)
+        st.rerun()
 
 
 def render_health_check():
