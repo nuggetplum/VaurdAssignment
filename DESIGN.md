@@ -1,168 +1,110 @@
-# DESIGN.md
+# Design
 
-Go service reads order events off NATS JetStream, keeps one row per order in
-Postgres, serves it at `GET /orders`. Python generator publishes the events,
-including deliberate duplicates and backdated ones so the edge cases are visible
-while it runs.
+## 1. Architecture
 
 ```
-┌───────────┐  publish   ┌─────────────────┐  consume    ┌────────────────────────────┐  HTTP/JSON  ┌──────────┐
-│ Generator │ ──────────▶│  NATS JetStream  │ ───────────▶│      Go Backend Service     │ ◀────────── │ Reviewer │
-│ (Python)  │   events   │  stream ORDERS   │  durable    │  decode → derive ID →       │   GET      │  curl    │
-└───────────┘            │  subj:           │  consumer   │  worker pool → UPSERT → ack │  /orders   └──────────┘
-      ▲                   │  orders.events  │             └──────────────┬─────────────┘
-      │                   └─────────────────┘                            │
-      │                            │                                     ▼
-      │                            │                              ┌─────────────┐
-      │                            └──────────────────────────────│  PostgreSQL  │
-      │ discovers orderIds via                                    │ (1 row/order)│
-      │ GET /orders (throttled cache)                              └─────────────┘
-      └───────────────────────────────────────────────────────────────────────────
+  ┌─────────────┐      publish       ┌──────────────────┐      consume       ┌──────────────────────┐
+  │  Generator  │  ───────────────▶  │  NATS JetStream  │  ───────────────▶  │    Go Backend        │
+  │  (Python)   │   orders.events    │  stream: ORDERS  │  durable consumer  │  decode → route →    │
+  │  producer   │                    │  (persistent)    │                    │  UPSERT → ack        │
+  └─────────────┘                    └──────────────────┘                    └──────────┬───────────┘
+         ▲                                                                               │
+         │  discovers orderIds                                                           │  write
+         │  via GET /orders                                                              ▼
+         │                                                                    ┌──────────────────────┐
+         │                                                                    │     PostgreSQL       │
+         │                                                                    │  current state       │
+         │                                                                    │  (1 row per order)   │
+         │                                                                    └──────────┬───────────┘
+         │                                                                               │  read
+         │                                                                    ┌──────────▼───────────┐
+         └────────────────────────────────────────────────────────────────  │  HTTP API  GET /orders│  ◀── Reviewer (curl)
+                                                                              └──────────────────────┘
 ```
 
-**The one idea that matters:** every correctness guarantee lives in a single
-conditional UPSERT in `db/repository.go`. Last-write-wins and the status state
-machine are one atomic `WHERE` clause. Nothing else in the system needs to be
-correct for state to stay correct.
+Two processes communicating only through NATS JetStream:
 
-## Edge cases and solutions
+- **Generator** (Python) — a producer only; never touches the database. It learns real order IDs solely by reading them back from `GET /orders`, never via a side channel.
+- **Backend** (Go) — consumer + query API. It persists state and serves reads from the same table.
 
-| Concern | Decision | Where |
-|---|---|---|
-| Out-of-order | Order by event time; insert a partial row if the create hasn't landed | §5.1 |
-| Concurrency | Atomic UPSERT is the guarantee; worker pool is only throughput | §5.2 |
-| Duplicates | Updates no-op via strict `>`; creates get a deterministic UUIDv5 ID | §5.3 |
-| Status transitions | Enforced in SQL. Log + count, don't drop, don't nak | §5.4 |
-| Throughput | JetStream buffers, pool parallelizes per order, blocking = backpressure | §5.5 |
-| "Latest" | Event time for correctness, wall clock for sorting — on purpose | §5.6 |
+**Why JetStream (not gRPC / HTTP POST / Kafka):** the brief frames this as an event-driven, durable-state problem. JetStream gives at-least-once delivery with explicit ack (a crash mid-processing redelivers, not drops) and decoupling (generator keeps publishing while the service is down). Kafka offers the same but is heavier; JetStream is one lightweight container.
 
-## How it works
+**Why HTTP/JSON for the query API (not gRPC):** it's `curl`-able and human-readable, which directly serves the runnability criterion. No other service consumes it programmatically, so proto tooling would add cost for no gain.
 
-**Transport: JetStream, not a direct call.** Durable, explicit ack, so a crash
-mid-event redelivers orders instead of losing it. Generator keeps publishing if the
-service is down. Considered using kafka as it gives the same guarantees but is much heavier to run for this scope.
+---
 
-**API: HTTP/JSON.** Simple HTTP for this demo. In a production enviroment where it is consumed by other programs and bears more load, gRPC would be the better option. 
+## 2. Data model
+
+One table, one row per order — the current-state table:
 
 ```sql
 CREATE TABLE orders (
     order_id        TEXT PRIMARY KEY,
-    customer_id     TEXT,
-    restaurant_id   TEXT,
-    status          TEXT,
-    items           JSONB,
-    last_event_at   TIMESTAMPTZ NOT NULL,   -- event time, the ordering key
-    last_updated_at TIMESTAMPTZ            -- wall clock, what the API returns
+    customer_id     TEXT,                  -- nullable: knowledge may be incomplete
+    restaurant_id   TEXT,                  -- nullable
+    status          TEXT,                  -- nullable
+    items           JSONB,                 -- nullable
+    last_event_at   TIMESTAMPTZ NOT NULL,  -- EVENT time — the ordering key
+    last_updated_at TIMESTAMPTZ            -- WALL-CLOCK time — what the API reports
 );
 ```
 
-Two timestamps because they answer different questions — see §5.6. Data columns
-are nullable because our knowledge can be incomplete, not because the real
-values can be null (§5.1).
+Two deliberate "when" columns:
 
-Flow:
+- **`last_event_at`** — the `occurredAt` of the winning event. This is the *ordering key*: "is this event newer" always compares this, never wall clock.
+- **`last_updated_at`** — `now()` on every actual write. This is what `GET /orders` reports as `lastUpdated` and what `sort=last_updated_*` uses — i.e. "when our system last learned something," which is what a live dashboard wants.
 
-1. Publish JSON to `orders.events`.
-2. Consumer decodes. Bad JSON / no `eventId` / update with no `orderId` →
-   `Term()`. Dropped for good, since redelivery can't fix a parse error.
-3. On `order.create` only, derive `orderId = UUIDv5(NAMESPACE, eventId)`.
-4. Pool hashes `orderId` → same order always hits the same goroutine.
-5. Worker runs the UPSERT. Ack on success, nak on error.
-6. `GET /orders` reads the same table. No separate read model to go stale.
+Fields are nullable because *our knowledge* of them can be briefly incomplete (see §5.1), not because the real values can be null.
 
-## §5.1 Out-of-order events
+---
 
-Ordering is by `occurredAt`, never arrival time.
-`WHERE excluded.last_event_at > orders.last_event_at` is included to guard against out of order events, so an older event is a
-no-op whenever it shows up.
+## 3. Event flow
 
-The case the brief asks about — **an update for an order we never created:**
+1. **Generator** publishes a JSON event to subject `orders.events`.
+2. **Consumer** (`broker/consumer.go`) pulls a message, decodes it, and for `order.create` derives the ID server-side: `orderId = UUIDv5(ORDER_NAMESPACE, eventId)`. Malformed messages are `Term()`'d (dropped) — redelivery can't fix a parse error.
+3. **Worker pool** (`broker/pool.go`) hashes `orderId` to a worker, so all events for one order apply in submission order while different orders run in parallel.
+4. **`Repository.ApplyEvent`** (`db/repository.go`) runs one conditional `UPSERT` — where all correctness lives. Ack on success, nak (redeliver) on error.
+5. **`GET /orders`** (`server/handlers.go`) reads from the same table — no separate read model to go stale.
 
-- Can't happen via our generator (it only updates IDs it read back from the
-  API), but we don't control every producer. Handled anyway, and
-  `generator/demo_hook.py` proves it by publishing a raw update straight to
-  JetStream.
-- No row exists → plain INSERT → **partial row**, unknown fields NULL. We keep
-  the event rather than dropping an orphan.
-- **The tradeoff:** a late create does *not* backfill customer/restaurant. It
-  carries `status: Received`, and since LWW and the state machine are one
-  combined condition, a row already at `Preparing` rejects the whole update —
-  names included. State machine beats backfilling. Deliberate: the alternative
-  is splitting the condition, which reopens a race. A real fix is a background
-  reconciler, out of scope here. Walked through live in `test.md` scenario 5.
-- The state machine only applies from an order's *second* status event. A
-  partial row has no baseline, so its first status is accepted whatever it is.
+---
 
-## §5.2 Concurrency
+## 4. Design considerations
 
-- Correctness = the atomic conditional UPSERT. One statement, so Postgres row
-  locking handles any number of goroutines *or* service instances. No
-  read-then-write gap because there's no separate read.
-- The hashed worker pool is a **throughput optimization, not the guarantee.**
-  Routing one order's events to one goroutine just cuts lock contention. The
-  UPSERT stays correct with random routing or a single-threaded consumer.
-- That separation is the point: `WORKER_COUNT` is tunable, and the pool could be
-  deleted entirely, without touching correctness.
-- These are real goroutines scheduled across cores, not single-threaded async.
+### 4.1 Out-of-order events
 
-## §5.3 Duplicate / replayed events
+Two layers. **Within** a create→update sequence, ordering is by `occurredAt`, not arrival — an event claiming to predate what we recorded is a no-op (see §4.3 LWW). **The called-out edge case** — an update arriving before its create — can't happen via the generator (it only updates IDs read back from `GET /orders`, which exist only after the create persisted), but is handled defensively anyway (proven by `generator/demo_hook.py`):
 
-Two mechanisms, because creates and updates need different things:
+- The update's UPSERT becomes a plain `INSERT` of a **partial row** — only that event's fields populated; the rest stay `NULL`.
+- A later create fills the `NULL` customer/restaurant fields without clobbering an existing status, guarded by the same LWW check.
+- The transition check (§4.4) applies only from an order's *second* status event on, so a partial row's first status is accepted outright.
 
-- **Updates — idempotent for free.** A replay carries the same `occurredAt`, and
-  the guard is a strict `>`, so it fails. No dedup table needed.
-- **Creates — need a stable ID.** A random ID per delivery would make a replay
-  look like a new order and `ON CONFLICT` would never fire. So
-  `orderId = UUIDv5(NAMESPACE, eventId)` — same event, same PK, real conflict →
-  `DO UPDATE` → identical timestamp then fails LWW. Both steps are load-bearing;
-  the PK conflict alone wouldn't stop it.
+### 4.2 Concurrency
 
-## §5.4 Status transitions
+The correctness mechanism is the **atomic conditional UPSERT** — a single SQL statement, so Postgres row-level locking makes it correct regardless of goroutine or instance count. No read-then-write race, because there's no separate read.
 
-Enforced: `Received -> Preparing -> Complete`, `Cancelled` from either
-non-terminal state, `Complete`/`Cancelled` terminal. Written into the same
-`WHERE` clause as the timestamp check, so it's atomic and can't race.
+The hashed worker pool is a **throughput optimization, not the guarantee** — it reduces lock contention but the UPSERT stays correct even with random routing or a single consumer. So `WORKER_COUNT` can be tuned or removed without touching correctness.
 
-- **Decision: enforce, log, count.** Silently dropping corrupts state. Naking
-  lets one bad event jam the pipeline forever. Logging keeps it visible without
-  being disruptive.
-- "0 rows affected" looks identical for a stale timestamp and a bad transition,
-  so on that path only, one follow-up read tells them apart. Timestamp is
-  checked first — if the event isn't newer, that alone explains it.
-- Caveat: that read was meant to be a rare path and isn't. Orders drift into
-  terminal states, and from terminal most of the generator's random status picks
-  get rejected, so a fair chunk of status updates take the extra read.
+### 4.3 Duplicates / replays
 
-## §5.5 Throughput
+- **Updates are idempotent for free:** the guard is *strict* — `WHERE excluded.last_event_at > orders.last_event_at` — so a replay with the same timestamp is a no-op. No dedup table.
+- **Creates need a stable ID:** `orderId = UUIDv5(ORDER_NAMESPACE, eventId)`. A replayed create derives the same ID, hits the same primary key, and becomes a conflict → no-op, not a duplicate row.
 
-- JetStream buffers — the generator can outrun the service, nothing drops.
-- The pool parallelizes across orders while serializing within one.
-- `WORKER_COUNT` / `WORKER_BUFFER_SIZE` are env-tunable. `Submit` blocks on a
-  full buffer, and that block is the backpressure signal.
-- **Honest gap — the DB pool isn't tuned.** `InitDB` never sets `MaxConns`, so
-  pgx defaults to `max(4, NumCPU)`. At `WORKER_COUNT=8` on 4 cores, half the
-  workers just wait on connections. Effective parallelism is the smaller number
-  and the two knobs don't know about each other.
-- **Honest gap — indexes help less than they look.**
-  `WHERE ($1 = '' OR status = $1)` isn't sargable, so `idx_orders_status` goes
-  unused, and there's no composite `(status, last_updated_at)` for the
-  filter-and-sort path. The plain sort is covered.
+### 4.4 Status transitions
 
-## §5.6 "Latest" guarantees
+Enforced: `Received → Preparing → Complete`; `Cancelled` from either non-terminal state; `Complete`/`Cancelled` terminal. Encoded in the same UPSERT `WHERE` clause as the LWW check, so invalid transitions can't slip through a race either.
 
-- Correctness orders by **event time** (`occurredAt`). That's §5.1–5.3 in one line.
-- The API's `lastUpdated` reports **wall-clock write time** instead, on purpose.
-- Mixing them breaks something either way: sort by event time and a backdated
-  event pollutes recency ordering; decide correctness by write time and arrival
-  order silently overrides what the event actually claims.
-- So `last_event_at` is internal and `last_updated_at` is what you see.
+Decision: **enforce + log + count** (`Repository.InvalidTransitionCount()`), don't silently drop or error the pipeline. A bogus transition signals an upstream bug; accepting it corrupts state, but killing the pipeline lets one bad event take down healthy processing.
 
-## Known limitations
+Nuance: a no-op UPSERT can't say *why* (stale timestamp vs. invalid transition both show "0 rows"). Only on that rare no-op path, `ApplyEvent` does one cheap read to disambiguate — stale/duplicate is logged, and only a *newer* timestamp with an invalid transition counts against the metric.
 
-- **No automated testing.** Everything above rests on one uncovered SQL statement.
-- **Single NATS/Postgres, no HA**, and JetStream storage is a local Docker
-  volume. Fine for this scope. Nothing in the design depends on single-instance
-  behaviour, so going HA wouldn't change the architecture.
+### 4.5 Throughput
 
-Streamlit dashboard in `dashboard/` is optional and not part of the core
-deliverable — curl works fine.
+- **JetStream** buffers and applies backpressure — publish faster than consume without loss.
+- **Hashed worker pool** parallelizes across orders; scales with `WORKER_COUNT`.
+- **`pgxpool`** caps concurrent DB connections — a burst backs up on workers, not on Postgres.
+- **Indexes** (`idx_orders_status`, `idx_orders_last_updated`) keep filter/sort off full scans.
+- `WORKER_COUNT`, `WORKER_BUFFER_SIZE`, and HTTP/DB config are all env-tunable.
+
+### 4.6 "Latest" guarantee
+
+"Latest" = **event time** (`occurredAt`), the idea threading §4.1–4.3. The API's `lastUpdated` reports **wall-clock write time** — a deliberately different guarantee answering "when did we last learn something," which is what sorting/monitoring wants. Conflating them would either break recency sorting (a backdated event keeps winning) or make correctness fragile (wall-clock order deciding which event is newer).
